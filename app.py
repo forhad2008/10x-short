@@ -1,66 +1,38 @@
 import os
-import uuid
 import io
+import uuid
 
-from flask import (
-    Flask,
-    render_template,
-    request,
-    jsonify,
-    send_from_directory
-)
-
+from flask import Flask, send_from_directory, request, jsonify
 from PIL import Image, ImageOps
 
 
+# =========================================================
+# APP SETUP
+# =========================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_FOLDER = os.path.join(BASE_DIR, "outputs")
+
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
 app = Flask(__name__)
 
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
-OUTPUT_FOLDER = os.path.join(
-    BASE_DIR,
-    "outputs"
-)
-
-os.makedirs(
-    OUTPUT_FOLDER,
-    exist_ok=True
-)
-
-
-# =========================================================
-# MAIN SETTINGS
-# =========================================================
-
-TARGET_RATIO = 0.10
-# 10% of original = 10x smaller
-
-MIN_QUALITY = 35
-MAX_QUALITY = 100
-
-# No hard upload-size restriction.
+# No artificial upload-size limit.
 app.config["MAX_CONTENT_LENGTH"] = None
 
+# Target = 10% of original file size.
+TARGET_RATIO = 0.10
+
+# The compressor can go lower if necessary to reach the target.
+MIN_QUALITY = 30
+MAX_QUALITY = 100
+
 
 # =========================================================
-# FORMAT HELPERS
+# BASIC HELPERS
 # =========================================================
-
-def extension_from_name(filename):
-
-    if "." in filename:
-        return filename.rsplit(
-            ".",
-            1
-        )[1].lower()
-
-    return "jpg"
-
 
 def format_bytes(size):
-
     if size < 1024:
         return f"{size} B"
 
@@ -73,48 +45,47 @@ def format_bytes(size):
     return f"{size / (1024 * 1024 * 1024):.2f} GB"
 
 
-def clean_name(filename):
+def clean_filename(filename):
+    filename = os.path.basename(filename)
 
-    base = os.path.basename(filename)
+    name, _ = os.path.splitext(filename)
 
-    name, _ = os.path.splitext(base)
+    name = name.strip()
 
-    return name[:80]
+    if not name:
+        name = "image"
+
+    return name[:100]
 
 
 # =========================================================
 # IMAGE PREPARATION
 # =========================================================
 
-def prepare_rgb(image):
-
+def prepare_image(image):
     """
-    Convert image to RGB for JPEG encoding.
-    Transparency is placed over white.
+    Correct EXIF orientation without cropping.
+    """
+
+    try:
+        image = ImageOps.exif_transpose(image)
+    except Exception:
+        pass
+
+    return image
+
+
+def to_rgb(image):
+    """
+    Convert an image to RGB for JPEG encoding.
+
+    Transparent images are placed on a white background.
     """
 
     if image.mode == "RGB":
         return image
 
-    if image.mode in ("RGBA", "LA"):
-
-        rgba = image.convert("RGBA")
-
-        background = Image.new(
-            "RGB",
-            rgba.size,
-            (255, 255, 255)
-        )
-
-        background.paste(
-            rgba,
-            mask=rgba.getchannel("A")
-        )
-
-        return background
-
-    if image.mode == "P":
-
+    if image.mode in ("RGBA", "LA", "P"):
         rgba = image.convert("RGBA")
 
         background = Image.new(
@@ -133,31 +104,12 @@ def prepare_rgb(image):
     return image.convert("RGB")
 
 
-def prepare_image(image):
-
-    """
-    Fix EXIF orientation without cropping.
-    """
-
-    try:
-
-        image = ImageOps.exif_transpose(
-            image
-        )
-
-    except Exception:
-        pass
-
-    return image
-
-
 # =========================================================
-# ENCODING
+# ENCODERS
 # =========================================================
 
 def encode_jpeg(image, quality):
-
-    image = prepare_rgb(image)
+    image = to_rgb(image)
 
     buffer = io.BytesIO()
 
@@ -174,20 +126,12 @@ def encode_jpeg(image, quality):
 
 
 def encode_webp(image, quality):
-
     buffer = io.BytesIO()
 
-    if image.mode not in (
-        "RGB",
-        "RGBA"
-    ):
-
+    if image.mode not in ("RGB", "RGBA"):
         if "A" in image.mode:
-
             image = image.convert("RGBA")
-
         else:
-
             image = image.convert("RGB")
 
     image.save(
@@ -201,45 +145,51 @@ def encode_webp(image, quality):
 
 
 # =========================================================
-# CREATE CANDIDATE
+# CREATE FORMAT CANDIDATES
 # =========================================================
 
-def make_candidates(image, quality):
+def create_candidates(image, quality):
 
     candidates = []
 
+    # -------------------------
     # JPEG
-    try:
+    # -------------------------
 
-        jpeg_data = encode_jpeg(
+    try:
+        data = encode_jpeg(
             image,
             quality
         )
 
         candidates.append({
-            "data": jpeg_data,
+            "data": data,
             "format": "JPEG",
             "extension": "jpg",
-            "size": len(jpeg_data)
+            "size": len(data),
+            "quality": quality
         })
 
     except Exception:
         pass
 
 
+    # -------------------------
     # WEBP
-    try:
+    # -------------------------
 
-        webp_data = encode_webp(
+    try:
+        data = encode_webp(
             image,
             quality
         )
 
         candidates.append({
-            "data": webp_data,
+            "data": data,
             "format": "WEBP",
             "extension": "webp",
-            "size": len(webp_data)
+            "size": len(data),
+            "quality": quality
         })
 
     except Exception:
@@ -247,232 +197,192 @@ def make_candidates(image, quality):
 
 
     if not candidates:
-
         raise RuntimeError(
-            "The image could not be encoded."
+            "Could not encode the image."
         )
-
 
     return candidates
 
 
-# =========================================================
-# BEST ENCODING
-# =========================================================
+def smallest_candidate(image, quality):
 
-def best_encoding(image, quality):
-
-    candidates = make_candidates(
+    candidates = create_candidates(
         image,
         quality
     )
 
     return min(
         candidates,
-        key=lambda x: x["size"]
+        key=lambda item: item["size"]
     )
 
 
 # =========================================================
-# SMART QUALITY SEARCH
+# QUALITY SEARCH
 # =========================================================
 
-def find_quality(image, target_bytes):
+def find_best_quality(image, target_size):
 
-    """
-    Search for the highest possible quality that
-    gets close to the target size.
-
-    No fixed 92% quality requirement.
-    """
+    best = None
 
     low = MIN_QUALITY
     high = MAX_QUALITY
 
-    best = None
 
-    # First test quality 100
+    # Test maximum quality first.
     try:
-
-        result = best_encoding(
+        maximum = smallest_candidate(
             image,
-            100
+            MAX_QUALITY
         )
 
-        best = result
+        best = maximum
 
-        if result["size"] <= target_bytes:
-
-            return result
+        if maximum["size"] <= target_size:
+            return maximum
 
     except Exception:
         pass
 
 
-    # Binary quality search
-    for _ in range(8):
+    # Binary search for a good quality.
+    for _ in range(9):
 
         if low > high:
             break
 
-        middle = (
-            low + high
-        ) // 2
-
+        quality = (low + high) // 2
 
         try:
-
-            candidate = best_encoding(
+            candidate = smallest_candidate(
                 image,
-                middle
+                quality
             )
-
         except Exception:
-
             break
 
 
-        if (
-            best is None
-            or
-            abs(
-                candidate["size"]
-                -
-                target_bytes
-            )
-            <
-            abs(
-                best["size"]
-                -
-                target_bytes
-            )
-        ):
-
+        if best is None:
             best = candidate
-
-
-        if candidate["size"] > target_bytes:
-
-            high = middle - 1
-
         else:
+            current_difference = abs(
+                best["size"] - target_size
+            )
 
-            low = middle + 1
+            new_difference = abs(
+                candidate["size"] - target_size
+            )
+
+            if new_difference < current_difference:
+                best = candidate
+
+
+        if candidate["size"] > target_size:
+            high = quality - 1
+        else:
+            low = quality + 1
 
 
     return best
 
 
 # =========================================================
-# SMART RESOLUTION SEARCH
+# RESIZE WITHOUT CROPPING
 # =========================================================
 
-def resize_proportionally(
-    image,
-    scale
-):
+def proportional_resize(image, scale):
 
-    width = max(
+    new_width = max(
         1,
-        round(
-            image.width * scale
-        )
+        round(image.width * scale)
     )
 
-    height = max(
+    new_height = max(
         1,
-        round(
-            image.height * scale
-        )
+        round(image.height * scale)
     )
 
 
     if (
-        width == image.width
+        new_width == image.width
         and
-        height == image.height
+        new_height == image.height
     ):
-
         return image
 
 
     return image.resize(
-        (
-            width,
-            height
-        ),
+        (new_width, new_height),
         Image.Resampling.LANCZOS
     )
 
 
-def smart_compress(
-    image,
-    target_bytes
-):
+# =========================================================
+# SMART 10X COMPRESSOR
+# =========================================================
 
-    """
-    Main compression engine.
+def smart_compress(image, original_size):
 
-    Strategy:
-
-    1. Try original dimensions.
-    2. Find highest quality near target.
-    3. If still too large, gradually reduce resolution.
-    4. Re-check quality at every resolution.
-    5. Keep the candidate closest to target.
-    """
-
-    best_overall = None
+    target_size = max(
+        1,
+        int(original_size * TARGET_RATIO)
+    )
 
 
-    # -----------------------------------------------------
-    # Resolution scales
-    # -----------------------------------------------------
+    best = None
 
+
+    # We prefer keeping the original dimensions.
+    # Resolution is reduced only when necessary.
     scales = [
-
         1.00,
-
-        0.95,
-        0.90,
+        0.97,
+        0.94,
+        0.91,
+        0.88,
         0.85,
-        0.80,
-        0.75,
+        0.82,
+        0.79,
+        0.76,
+        0.73,
         0.70,
-        0.65,
-        0.60,
+        0.67,
+        0.64,
+        0.61,
+        0.58,
         0.55,
-        0.50,
-
-        0.45,
+        0.52,
+        0.49,
+        0.46,
+        0.43,
         0.40,
-        0.35,
-        0.30,
+        0.37,
+        0.34,
+        0.31,
+        0.28,
         0.25,
-        0.20,
-        0.15,
+        0.22,
+        0.19,
+        0.16,
+        0.13,
         0.10
-
     ]
 
 
     for scale in scales:
 
-        working_image = resize_proportionally(
+        working_image = proportional_resize(
             image,
             scale
         )
 
 
         try:
-
-            candidate = find_quality(
+            candidate = find_best_quality(
                 working_image,
-                target_bytes
+                target_size
             )
-
         except Exception:
-
             continue
 
 
@@ -480,131 +390,96 @@ def smart_compress(
             continue
 
 
-        candidate["width"] = (
-            working_image.width
-        )
-
-        candidate["height"] = (
-            working_image.height
-        )
-
+        candidate["width"] = working_image.width
+        candidate["height"] = working_image.height
         candidate["scale"] = scale
 
 
-        # -------------------------------------------------
-        # First valid candidate
-        # -------------------------------------------------
+        if best is None:
 
-        if best_overall is None:
-
-            best_overall = candidate
+            best = candidate
 
         else:
 
-            current_difference = abs(
-                best_overall["size"]
-                -
-                target_bytes
+            old_difference = abs(
+                best["size"] - target_size
             )
 
             new_difference = abs(
-                candidate["size"]
-                -
-                target_bytes
+                candidate["size"] - target_size
             )
 
-
-            if new_difference < current_difference:
-
-                best_overall = candidate
+            if new_difference < old_difference:
+                best = candidate
 
 
-        # -------------------------------------------------
-        # If target reached, stop.
-        #
-        # Because higher resolution is preferred,
-        # this gives us the best quality/resolution
-        # result found so far.
-        # -------------------------------------------------
-
-        if candidate["size"] <= target_bytes:
-
-            # Don't immediately stop at a tiny file.
-            # Continue one more nearby scale if useful.
-
-            if scale >= 0.50:
-
-                break
+        # Once we have reached the target at a
+        # reasonably large resolution, stop.
+        if (
+            candidate["size"] <= target_size
+            and
+            scale >= 0.40
+        ):
+            break
 
 
-    if best_overall is None:
-
+    if best is None:
         raise RuntimeError(
             "Unable to compress this image."
         )
 
 
-    return best_overall
+    return best, target_size
 
 
 # =========================================================
 # SAVE OUTPUT
 # =========================================================
 
-def save_result(
-    candidate,
-    filename
-):
+def save_output(candidate, original_filename):
 
-    output_name = (
-        filename
-        +
-        "-"
-        +
-        uuid.uuid4().hex[:8]
-        +
-        "."
-        +
-        candidate["extension"]
+    base_name = clean_filename(
+        original_filename
     )
 
+    unique_id = uuid.uuid4().hex[:10]
 
-    output_path = os.path.join(
+    filename = (
+        base_name
+        + "_10x_"
+        + unique_id
+        + "."
+        + candidate["extension"]
+    )
+
+    path = os.path.join(
         OUTPUT_FOLDER,
-        output_name
+        filename
     )
 
 
-    with open(
-        output_path,
-        "wb"
-    ) as file:
-
-        file.write(
-            candidate["data"]
-        )
+    with open(path, "wb") as file:
+        file.write(candidate["data"])
 
 
-    return (
-        output_name,
-        output_path
-    )
+    return filename
 
 
 # =========================================================
-# HOME
+# HOME PAGE
 # =========================================================
 
 @app.route("/")
-def index():
+def home():
 
-    return render_template(
+    return send_from_directory(
+        BASE_DIR,
         "index.html"
     )
 
 
 # =========================================================
-# RESIZE
+# COMPRESS API
 # =========================================================
 
 @app.route(
@@ -619,7 +494,7 @@ def resize():
 
             return jsonify({
                 "success": False,
-                "error": "No image selected."
+                "error": "No image was uploaded."
             }), 400
 
 
@@ -635,7 +510,7 @@ def resize():
 
 
         # -------------------------------------------------
-        # Read directly into memory
+        # Read uploaded image
         # -------------------------------------------------
 
         original_data = uploaded.read()
@@ -658,19 +533,18 @@ def resize():
         # Open image
         # -------------------------------------------------
 
-        source = io.BytesIO(
+        image_stream = io.BytesIO(
             original_data
         )
 
-
         image = Image.open(
-            source
+            image_stream
         )
-
 
         image.load()
 
 
+        # Correct orientation.
         image = prepare_image(
             image
         )
@@ -679,17 +553,10 @@ def resize():
         original_width = image.width
         original_height = image.height
 
-
-        # -------------------------------------------------
-        # TARGET = 10%
-        # -------------------------------------------------
-
-        target_bytes = max(
-            1,
-            int(
-                original_size *
-                TARGET_RATIO
-            )
+        original_format = (
+            image.format
+            or
+            "Unknown"
         )
 
 
@@ -697,9 +564,9 @@ def resize():
         # COMPRESS
         # -------------------------------------------------
 
-        result = smart_compress(
+        candidate, target_size = smart_compress(
             image,
-            target_bytes
+            original_size
         )
 
 
@@ -707,47 +574,44 @@ def resize():
         # SAVE
         # -------------------------------------------------
 
-        clean_filename = clean_name(
+        output_filename = save_output(
+            candidate,
             uploaded.filename
         )
 
 
-        output_name, output_path = save_result(
-            result,
-            clean_filename
+        output_path = os.path.join(
+            OUTPUT_FOLDER,
+            output_filename
         )
 
 
-        final_size = os.path.getsize(
+        new_size = os.path.getsize(
             output_path
         )
 
 
         # -------------------------------------------------
-        # STATS
+        # STATISTICS
         # -------------------------------------------------
-
-        actual_percent = (
-            final_size /
-            original_size
-        ) * 100
-
 
         reduction_percent = (
             1 -
             (
-                final_size /
+                new_size /
                 original_size
             )
         ) * 100
 
 
-        # -------------------------------------------------
-        # TARGET DISTANCE
-        # -------------------------------------------------
+        remaining_percent = (
+            new_size /
+            original_size
+        ) * 100
+
 
         target_reached = (
-            final_size <= target_bytes
+            new_size <= target_size
         )
 
 
@@ -755,33 +619,33 @@ def resize():
 
             "success": True,
 
-            "filename":
-                output_name,
+            "filename": output_filename,
 
             "preview_url":
                 "/outputs/"
-                +
-                output_name,
+                + output_filename,
 
             "download_url":
                 "/download/"
-                +
-                output_name,
+                + output_filename,
 
             "original_size":
                 original_size,
 
             "new_size":
-                final_size,
+                new_size,
 
             "target_size":
-                target_bytes,
+                target_size,
 
             "reduction_percent":
                 reduction_percent,
 
-            "actual_percent":
-                actual_percent,
+            "remaining_percent":
+                remaining_percent,
+
+            "target_reached":
+                target_reached,
 
             "original_width":
                 original_width,
@@ -790,28 +654,22 @@ def resize():
                 original_height,
 
             "width":
-                result["width"],
+                candidate["width"],
 
             "height":
-                result["height"],
-
-            "quality":
-                result.get(
-                    "quality",
-                    None
-                ),
+                candidate["height"],
 
             "format":
-                result["format"],
+                candidate["format"],
+
+            "quality":
+                candidate["quality"],
 
             "scale":
-                result["scale"],
-
-            "target_reached":
-                target_reached,
+                candidate["scale"],
 
             "original_format":
-                image.format or "Unknown"
+                original_format
 
         })
 
@@ -819,7 +677,7 @@ def resize():
     except Exception as error:
 
         print(
-            "Compression error:",
+            "IMAGE ERROR:",
             repr(error)
         )
 
@@ -829,7 +687,7 @@ def resize():
             "success": False,
 
             "error":
-                "Could not process this image: "
+                "Could not process the image: "
                 +
                 str(error)
 
@@ -843,7 +701,7 @@ def resize():
 @app.route(
     "/outputs/<path:filename>"
 )
-def output_file(filename):
+def preview(filename):
 
     return send_from_directory(
         OUTPUT_FOLDER,
@@ -868,7 +726,7 @@ def download(filename):
 
 
 # =========================================================
-# RUN
+# START SERVER
 # =========================================================
 
 if __name__ == "__main__":
